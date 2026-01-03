@@ -1,0 +1,226 @@
+/****************************************************
+ * CONFIG
+ ****************************************************/
+const GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent";
+const ALERT_THRESHOLDS = {
+  temperature: { min: 0, max: 50 },
+  humidity: { min: 20, max: 80 },
+  pressure: { min: 0.8, max: 1.2 },
+  distance: { min: 0, max: 500 }
+};
+const CONTEXT_READINGS = 5;
+
+/****************************************************
+ * MENU
+ ****************************************************/
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu("Sensor Dashboard")
+    .addItem("Generate Forecasts", "generateAllForecasts")
+    .addItem("Generate AI Summaries", "generateAllAISummaries")
+    .addToUi();
+}
+
+/****************************************************
+ * FORECAST FUNCTIONS
+ ****************************************************/
+function generateAllForecasts() {
+  [1, 6, 24].forEach(generateForecast);
+}
+
+function generateForecast(hours) {
+  const ss = SpreadsheetApp.getActive();
+  const sensor = ss.getSheetByName("SensorData");
+  if (!sensor || sensor.getLastRow() < 2) return;
+
+  const rows = sensor.getRange(2, 1, sensor.getLastRow() - 1, 5).getValues();
+  const t = rows.map(r => r[1]), h = rows.map(r => r[2]);
+  const p = rows.map(r => r[3]), d = rows.map(r => r[4]);
+  const lastTime = new Date(rows[rows.length - 1][0]);
+
+  const tf = holtForecast(t, lastTime, hours);
+  const hf = holtForecast(h, lastTime, hours);
+  const pf = holtForecast(p, lastTime, hours);
+  const df = emaForecast(d, lastTime, hours, 0.3);
+
+  const sheetName = `Forecast_${hours}H`;
+  let sh = ss.getSheetByName(sheetName) || ss.insertSheet(sheetName);
+  if (hours !== 24) {
+    sh.clear();
+  }
+
+  if (sh.getLastRow() === 0) {
+    sh.appendRow([
+    "Timestamp",
+    "Temperature Forecast","Temperature Upper","Temperature Lower",
+    "Humidity Forecast","Humidity Upper","Humidity Lower",
+    "Pressure Forecast","Pressure Upper","Pressure Lower",
+    "Distance ","Distance Upper","Distance Lower",
+    "Alert"
+  ]);
+  }
+  for (let i = 0; i < hours; i++) {
+    const alert = checkThresholds(tf[i].f, hf[i].f, pf[i].f, df[i].f);
+    sh.appendRow([
+      tf[i].time, tf[i].f, tf[i].u, tf[i].l,
+      hf[i].f, hf[i].u, hf[i].l,
+      pf[i].f, pf[i].u, pf[i].l,
+      df[i].f, df[i].u, df[i].l,
+      alert
+    ]);
+  }
+}
+
+function holtForecast(data, lastTime, hours) {
+  let alpha = 0.3, beta = 0.2;
+  let level = data[0], trend = data[1] - data[0];
+  for (let i = 1; i < data.length; i++) {
+    const prev = level;
+    level = alpha * data[i] + (1 - alpha) * (level + trend);
+    trend = beta * (level - prev) + (1 - beta) * trend;
+  }
+  const out = [];
+  for (let i = 1; i <= hours; i++) {
+    out.push(makeRow(lastTime, i, level + trend * i));
+  }
+  return out;
+}
+
+function emaForecast(data, lastTime, hours, alpha) {
+  let ema = data[0], out = [];
+  for (let i = 1; i < data.length; i++) {
+    ema = alpha * data[i] + (1 - alpha) * ema;
+  }
+  for (let i = 1; i <= hours; i++) {
+    let forecast = Math.max(0, ema + (Math.random() * 2 - 1) * 0.02 * ema);
+    out.push(makeRow(lastTime, i, forecast));
+    ema = forecast;
+  }
+  return out;
+}
+
+function makeRow(lastTime, step, val) {
+  const t = new Date(lastTime.getTime() + step * 3600000);
+  return { time: t, f: Math.round(val * 100) / 100, u: Math.round(val * 110) / 100, l: Math.round(val * 90) / 100 };
+}
+
+function checkThresholds(temp, hum, pres, dist) {
+  let alerts = [];
+  if (temp < ALERT_THRESHOLDS.temperature.min || temp > ALERT_THRESHOLDS.temperature.max) alerts.push("Temp");
+  if (hum < ALERT_THRESHOLDS.humidity.min || hum > ALERT_THRESHOLDS.humidity.max) alerts.push("Hum");
+  if (pres < ALERT_THRESHOLDS.pressure.min || pres > ALERT_THRESHOLDS.pressure.max) alerts.push("Pres");
+  if (dist < ALERT_THRESHOLDS.distance.min || dist > ALERT_THRESHOLDS.distance.max) alerts.push("Dist");
+  return alerts.join(", ") || "OK";
+}
+
+/****************************************************
+ * GEMINI API CALL
+ ****************************************************/
+function callGeminiAPI(promptText) {
+  const apiKey = PropertiesService.getScriptProperties().getProperty("GEMINI_API_KEY");
+  if (!apiKey) throw new Error("GEMINI_API_KEY not set in Script Properties");
+
+  const body = { contents: [{ parts: [{ text: promptText }] }] };
+
+  const response = UrlFetchApp.fetch(`${GEMINI_ENDPOINT}?key=${apiKey}`, {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(body),
+    muteHttpExceptions: true
+  });
+
+  const result = JSON.parse(response.getContentText());
+  if (result.error) return `Gemini error: ${result.error.message}`;
+
+  try {
+    return result.candidates
+      .map(c => c.content?.parts?.map(p => p.text).join("") || "")
+      .join("\n")
+      .trim();
+  } catch (e) {
+    return "Gemini returned unexpected format";
+  }
+}
+
+/****************************************************
+ * AI SUMMARY FUNCTIONS
+ ****************************************************/
+function generateAllAISummaries() {
+  generateRealTimeDataAnalysis();
+  generateTrendAnalysis();
+  generatePredictiveInsights(); // only 24-hour forecast
+}
+
+/* Real-Time Data Analysis */
+function generateRealTimeDataAnalysis() {
+  const ss = SpreadsheetApp.getActive();
+  const sheet = ss.getSheetByName("SensorData");
+  if (!sheet) return;
+
+  const rows = sheet.getRange(2, 1, sheet.getLastRow()-1, 5).getValues();
+  let summarySheet = ss.getSheetByName("RealTimeDataAnalysis") || ss.insertSheet("RealTimeDataAnalysis");
+  summarySheet.clear();
+  summarySheet.appendRow(["Timestamp","Sensor Analysis"]);
+
+  // Batch all sensors into one prompt
+  const prompt = `
+Analyze the following sensor data in 150 words:
+Timestamps: ${rows.map(r=>r[0]).join(", ")}
+Temperature: ${rows.map(r=>r[1]).join(", ")}
+Humidity: ${rows.map(r=>r[2]).join(", ")}
+Pressure: ${rows.map(r=>r[3]).join(", ")}
+Distance: ${rows.map(r=>r[4]).join(", ")}
+Provide one combined summary per sensor in a single column.
+  `;
+  const summary = callGeminiAPI(prompt);
+  summarySheet.appendRow(["All Sensors", summary]);
+}
+
+/* Trend Analysis */
+function generateTrendAnalysis() {
+  const ss = SpreadsheetApp.getActive();
+  const sheet = ss.getSheetByName("SensorData");
+  if (!sheet) return;
+
+  const rows = sheet.getRange(2, 1, sheet.getLastRow()-1, 5).getValues();
+  let summarySheet = ss.getSheetByName("TrendAnalysis") || ss.insertSheet("TrendAnalysis");
+  summarySheet.clear();
+  summarySheet.appendRow(["Timestamp","Sensor Trend Analysis"]);
+
+  const prompt = `
+Provide an executive trend summary of the following sensor data in 150 words:
+Timestamps: ${rows.map(r=>r[0]).join(", ")}
+Temperature: ${rows.map(r=>r[1]).join(", ")}
+Humidity: ${rows.map(r=>r[2]).join(", ")}
+Pressure: ${rows.map(r=>r[3]).join(", ")}
+Distance: ${rows.map(r=>r[4]).join(", ")}
+Focus on trends, anomalies, min, max, abnormality.
+Provide one combined summary in a single column.
+  `;
+  const summary = callGeminiAPI(prompt);
+  summarySheet.appendRow(["All Sensors", summary]);
+}
+
+/* Predictive Insights (24-hour forecast only) */
+function generatePredictiveInsights() {
+  const ss = SpreadsheetApp.getActive();
+  const sheet = ss.getSheetByName("Forecast_24H");
+  if (!sheet) return;
+
+  const rows = sheet.getRange(2, 1, sheet.getLastRow()-1, sheet.getLastColumn()).getValues();
+  let summarySheet = ss.getSheetByName("PredictiveInsight_24H") || ss.insertSheet("PredictiveInsight_24H");
+  summarySheet.clear();
+  summarySheet.appendRow(["Timestamp","Predictive Insight"]);
+
+  const prompt = `
+Provide predictive insights for the following 24-hour forecast in 150 words:
+Timestamps: ${rows.map(r=>r[0]).join(", ")}
+Temperature Forecast: ${rows.map(r=>r[1]).join(", ")}
+Humidity Forecast: ${rows.map(r=>r[4]).join(", ")}
+Pressure Forecast: ${rows.map(r=>r[7]).join(", ")}
+Distance Forecast: ${rows.map(r=>r[10]).join(", ")}
+Provide one combined summary in a single column.
+  `;
+  const summary = callGeminiAPI(prompt);
+  summarySheet.appendRow(["All Sensors", summary]);
+}
